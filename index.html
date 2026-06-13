@@ -817,15 +817,22 @@
     
     function initDB() {
         return new Promise((resolve, reject) => {
-            const req = indexedDB.open(DB_NAME, 1);
+            let settled = false;
+            const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+            let req;
+            try { req = indexedDB.open(DB_NAME, 1); }
+            catch(err) { return reject(err); }
             req.onupgradeneeded = e => {
                 const db = e.target.result;
                 if (!db.objectStoreNames.contains("store")) {
                     db.createObjectStore("store");
                 }
             };
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+            req.onsuccess = () => done(resolve, req.result);
+            req.onerror = () => done(reject, req.error);
+            req.onblocked = () => done(reject, new Error('IndexedDB blocked'));
+            // 일부 브라우저(시크릿 모드 등)에서 open이 멈추는 경우 대비 — 3초 후 강제 실패
+            setTimeout(() => done(reject, new Error('IndexedDB timeout')), 3000);
         });
     }
     
@@ -1065,13 +1072,21 @@
     // ================= 백그라운드 실시간 자동 로딩 (F5 / 접속 시 즉각 복구) =================
     window.onload = async () => {
         showLoading("저장된 데이터를 불러오는 중입니다...");
+        // 어떤 경우에도 로딩 화면이 무한히 떠 있지 않도록 안전 타이머 (네트워크/DB 지연 대비)
+        const loadingSafety = setTimeout(() => {
+            try {
+                hideLoading();
+                if (!window.IS_VIEW_MODE && !window.__cloudUid && typeof window.showAuthGate === 'function') window.showAuthGate();
+            } catch(_) {}
+        }, 6000);
+
         // 공유(보기 전용) 링크는 로컬 데이터를 적용하지 않고 클라우드 로딩을 기다림 (Firebase가 처리)
         if (window.IS_VIEW_MODE) { return; }
         try {
             const savedState = document.body.getAttribute('data-saved-state');
             if (savedState) {
                 applyData(JSON.parse(savedState));
-                hideLoading();
+                clearTimeout(loadingSafety); hideLoading();
                 return; 
             }
             
@@ -1093,9 +1108,9 @@
                 triggerAutoSave();
             }
         } catch(e) { 
-            applyData(defaultData); 
+            try { applyData(defaultData); } catch(_){}
         }
-        hideLoading();
+        clearTimeout(loadingSafety); hideLoading();
     };
 
     // ================= 로딩 렉 제거: 0.3초 지연 무제한 자동 저장 =================
@@ -2054,13 +2069,13 @@
   설정 전에도 로컬 저장 · 꾸미기는 정상 작동하며, 클라우드 기능만 비활성화됩니다.
 -->
 <script type="module">
-const firebaseConfig = {
-  apiKey: "AIzaSyAvm82552fuIT7eWJjjV9X6gHBDkwQpIFg",
-  authDomain: "cdplayer-314b8.firebaseapp.com",
-  projectId: "cdplayer-314b8",
-  storageBucket: "cdplayer-314b8.firebasestorage.app",
-  messagingSenderId: "191585860759",
-  appId: "1:191585860759:web:0a78cb5fb86716ba6c3dd2"
+const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyAvm82552fuIT7eWJjjV9X6gHBDkwQpIFg",
+    authDomain: "cdplayer-314b8.firebaseapp.com",
+    projectId: "cdplayer-314b8",
+    storageBucket: "cdplayer-314b8.firebasestorage.app",
+    messagingSenderId: "191585860759",
+    appId: "1:191585860759:web:0a78cb5fb86716ba6c3dd2"
 };
 
 const CONFIGURED = !!(FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.startsWith('YOUR_'));
@@ -2073,7 +2088,9 @@ function setCloudStatus(msg, isErr){
 }
 
 if (!CONFIGURED) {
-    // 클라우드 미설정: 경고를 표시하지 않음. 로그인 화면은 표시하되 '로컬로 시작'으로 진입 가능.
+    // 클라우드 미설정: 로그인 화면은 표시하되, 버튼을 누르면 안내 메시지 노출
+    const note = () => { const a = document.getElementById('authMsg'); if (a) { a.style.color = '#ffd9a0'; a.innerText = 'Firebase 설정이 아직 안 됐어요. 파일 상단 FIREBASE_CONFIG를 채우면 로그인이 켜집니다. (지금은 로컬로 시작 가능)'; } };
+    ['btnGoogle','btnLogin','btnSignup'].forEach(id => { const b = document.getElementById(id); if (b) b.onclick = note; });
     if (window.IS_VIEW_MODE) {
         try { window.applyData(window.defaultData); } catch(e){}
         if (typeof window.hideLoading === 'function') window.hideLoading();
@@ -2086,6 +2103,7 @@ if (!CONFIGURED) {
         const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js');
         const {
             getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup,
+            signInWithRedirect, getRedirectResult, browserPopupRedirectResolver,
             signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut
         } = await import('https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js');
         const {
@@ -2228,22 +2246,39 @@ if (!CONFIGURED) {
         // ---------- 인증 버튼 ----------
         const $ = id => document.getElementById(id);
         const provider = new GoogleAuthProvider();
+        provider.setCustomParameters({ prompt: 'select_account' });
+        const authMsg = (msg, ok) => { const a = $('authMsg'); if (a) { a.style.color = ok ? '#9fd3a0' : '#ffb3b3'; a.innerText = msg || ''; } };
+
+        // 리다이렉트 방식으로 돌아온 경우 결과 처리
+        try { await getRedirectResult(auth); } catch(e){ if (e && e.code !== 'auth/no-auth-event') authMsg('Google 로그인 실패: ' + (e.code || e.message || e)); }
 
         if ($('btnGoogle')) $('btnGoogle').onclick = async ()=>{
-            try { await signInWithPopup(auth, provider); }
-            catch(e){ setCloudStatus('Google 로그인 실패: '+(e.message||e), true); }
+            authMsg('Google 로그인 창을 여는 중...', true);
+            try {
+                await signInWithPopup(auth, provider, browserPopupRedirectResolver);
+            } catch(e){
+                const code = (e && e.code) || '';
+                // 팝업이 막히거나 닫힌 경우 → 리다이렉트 방식으로 자동 전환
+                if (code.includes('popup') || code === 'auth/cancelled-popup-request' || code === 'auth/operation-not-supported-in-this-environment') {
+                    try { await signInWithRedirect(auth, provider); return; }
+                    catch(e2){ authMsg('Google 로그인 실패: ' + ((e2&&e2.code)||e2.message||e2)); return; }
+                }
+                authMsg('Google 로그인 실패: ' + (code || e.message || e));
+            }
         };
         if ($('btnLogin')) $('btnLogin').onclick = async ()=>{
             const em = $('authEmail').value.trim(), pw = $('authPassword').value;
-            if (!em || !pw) { setCloudStatus('이메일과 비밀번호를 입력하세요.', true); return; }
+            if (!em || !pw) { authMsg('이메일과 비밀번호를 입력하세요.'); return; }
+            authMsg('로그인 중...', true);
             try { await signInWithEmailAndPassword(auth, em, pw); }
-            catch(e){ setCloudStatus('로그인 실패: '+(e.message||e), true); }
+            catch(e){ authMsg('로그인 실패: ' + ((e&&e.code)||e.message||e)); }
         };
         if ($('btnSignup')) $('btnSignup').onclick = async ()=>{
             const em = $('authEmail').value.trim(), pw = $('authPassword').value;
-            if (!em || pw.length < 6) { setCloudStatus('이메일과 6자 이상 비밀번호를 입력하세요.', true); return; }
+            if (!em || pw.length < 6) { authMsg('이메일과 6자 이상 비밀번호를 입력하세요.'); return; }
+            authMsg('가입 중...', true);
             try { await createUserWithEmailAndPassword(auth, em, pw); }
-            catch(e){ setCloudStatus('회원가입 실패: '+(e.message||e), true); }
+            catch(e){ authMsg('회원가입 실패: ' + ((e&&e.code)||e.message||e)); }
         };
         if ($('btnLogout')) $('btnLogout').onclick = async ()=>{
             try { await signOut(auth); location.href = location.origin + location.pathname; }
@@ -2302,10 +2337,15 @@ if (!CONFIGURED) {
         });
 
     } catch(err) {
-        setCloudStatus('Firebase 초기화 실패: ' + (err.message||err), true);
+        const msg = 'Firebase 연결 실패: ' + ((err && err.message) || err) + ' — 인터넷 연결 또는 FIREBASE_CONFIG 값을 확인하세요.';
+        setCloudStatus(msg, true);
+        const a = document.getElementById('authMsg'); if (a) { a.style.color = '#ffb3b3'; a.innerText = msg; }
+        ['btnGoogle','btnLogin','btnSignup'].forEach(id => { const b = document.getElementById(id); if (b) b.onclick = () => { const x = document.getElementById('authMsg'); if (x) x.innerText = msg; }; });
         if (window.IS_VIEW_MODE) {
             try { window.applyData(window.defaultData); } catch(e){}
             if (typeof window.hideLoading === 'function') window.hideLoading();
+        } else {
+            if (typeof window.showAuthGate === 'function') window.showAuthGate();
         }
     }
 }
